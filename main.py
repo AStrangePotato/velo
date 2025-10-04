@@ -1,47 +1,100 @@
 import cv2
-from preprocess import clean_frame
-from detect import RacketTracker
+import os
 
-def run():
-    in_path = 'input_video.mp4'
-    cap = cv2.VideoCapture(in_path)
-    if not cap.isOpened():
-        print(f"Error: Can't open {in_path}")
+# Main application imports
+import config
+from utils import ensure_dir_exists, save_results
+from preprocessing import (
+    read_video,
+    get_video_properties,
+    resize_frame,
+    create_background_subtractor,
+    subtract_background
+)
+from detect import process_frame_for_detection
+from visualization import display_stats
+
+def main():
+    """
+    Main function to run the badminton video analysis pipeline.
+    """
+    # --- Setup ---
+    # Ensure the output directory exists
+    output_dir = os.path.dirname(config.VIDEO_OUTPUT_PATH)
+    ensure_dir_exists(output_dir)
+
+    # --- Video Loading ---
+    try:
+        cap = read_video(config.VIDEO_INPUT_PATH)
+    except IOError as e:
+        print(f"Error: {e}")
         return
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    width, height, fps = get_video_properties(cap)
+    print(f"Input video properties: {width}x{height} @ {fps:.2f} FPS")
 
-    out_path = 'swing_analysis.mp4'
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+    # --- Video Writer Setup ---
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Or 'XVID'
+    out = cv2.VideoWriter(
+        config.VIDEO_OUTPUT_PATH,
+        fourcc,
+        fps,
+        (config.RESIZE_WIDTH, config.RESIZE_HEIGHT)
+    )
 
-    tracker = RacketTracker(fps)
+    # --- Main Processing Loop ---
+    frame_count = 0
+    all_analysis_data = []
 
-    while True:
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        clean = clean_frame(frame)
-        
-        new_frame, speed = tracker.find_and_track_racket(frame, clean)
-        
-        speed_txt = f"Speed: {speed:.2f} px/s"
-        peak_txt = f"Peak: {tracker.peak_racket_speed:.2f} px/s"
-        
-        cv2.putText(new_frame, speed_txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(new_frame, peak_txt, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        # --- Preprocessing ---
+        # Resize frame for consistent processing
+        frame = resize_frame(frame, config.RESIZE_WIDTH, config.RESIZE_HEIGHT)
 
-        out.write(new_frame)
+        # --- Detection and Analysis ---
+        # The core logic is encapsulated in process_frame_for_detection
+        processed_frame, frame_analysis = process_frame_for_detection(frame.copy())
+        frame_analysis['frame_number'] = frame_count
+        all_analysis_data.append(frame_analysis)
 
-    print(f"Peak speed: {tracker.peak_racket_speed:.2f} pixels/sec")
-    print(f"Output saved to {out_path}")
+        # --- Visualization ---
+        # Display mock statistics on the frame
+        mock_stats = {
+            "Rally Time": f"{(frame_count / fps):.1f}s",
+            "Last Stroke": "Smash" # This would come from analysis
+        }
+        display_stats(processed_frame, mock_stats)
 
+        # --- Output ---
+        # Write the processed frame to the output video file
+        out.write(processed_frame)
+
+        # Display the resulting frame (optional)
+        cv2.imshow('Badminton Analysis', processed_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+        frame_count += 1
+        print(f"Processed frame {frame_count}", end='\r')
+
+    # --- Cleanup ---
+    print("\nFinished processing video.")
     cap.release()
     out.release()
     cv2.destroyAllWindows()
 
+    # --- Save Results ---
+    results_to_save = {
+        "video_properties": {"width": width, "height": height, "fps": fps},
+        "analysis_summary": {"total_frames": frame_count},
+        "frame_by_frame_data": all_analysis_data
+    }
+    save_results(results_to_save, config.RESULTS_JSON_PATH)
+
 if __name__ == '__main__':
-    run()
+    main()

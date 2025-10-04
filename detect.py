@@ -1,54 +1,56 @@
 import cv2
-import numpy as np
+from collections import deque
 
-class RacketTracker:
-    def __init__(self, video_fps):
-        self.previous_racket_position = None
-        self.frames_per_second = video_fps
-        self.peak_racket_speed = 0
-        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+# Project-specific imports
+import config
+from calc import track_players, detect_shuttlecock, estimate_shot_trajectory
+from visualization import draw_player_bounding_box, draw_shuttlecock_position, draw_trajectory
 
-    def find_and_track_racket(self, frame, preprocessed_frame):
-        foreground_mask = self.background_subtractor.apply(preprocessed_frame)
-        _, foreground_mask = cv2.threshold(foreground_mask, 244, 255, cv2.THRESH_BINARY)
-        
-        kernel = np.ones((5, 5), np.uint8)
-        dilated_mask = cv2.dilate(foreground_mask, kernel, iterations=2)
+# In a real application, you would load these models properly.
+# For this placeholder, we'll pass None and the functions in `calc` will return mock data.
+PLAYER_DETECTOR_MODEL = None
+SHUTTLECOCK_MODEL = None
 
-        contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# Use a deque to store the last N positions of the shuttlecock for drawing its trail
+SHUTTLECOCK_TRAIL = deque(maxlen=32)
 
-        racket_contour = None
-        max_area = 0
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > 500:
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = float(w) / h
-                if 0.2 < aspect_ratio < 5.0:
-                    if area > max_area:
-                        max_area = area
-                        racket_contour = contour
+def process_frame_for_detection(frame):
+    """
+    This is the core detection and analysis pipeline for a single frame.
+    It orchestrates detection, tracking, and visualization.
 
-        current_racket_position = None
-        current_racket_speed = 0
+    Args:
+        frame (np.ndarray): The video frame to be processed.
 
-        if racket_contour is not None:
-            moments = cv2.moments(racket_contour)
-            if moments["m00"] != 0:
-                center_x = int(moments["m10"] / moments["m00"])
-                center_y = int(moments["m01"] / moments["m00"])
-                current_racket_position = (center_x, center_y)
+    Returns:
+        tuple: A tuple containing:
+            - np.ndarray: The processed frame with visualizations.
+            - dict: A dictionary containing analysis data for this frame.
+    """
+    analysis_data = {}
 
-                if self.previous_racket_position is not None:
-                    pixels_moved = np.linalg.norm(np.array(current_racket_position) - np.array(self.previous_racket_position))
-                    current_racket_speed = pixels_moved * self.frames_per_second
+    # 1. Detect and Track Players
+    player_boxes = track_players(frame, PLAYER_DETECTOR_MODEL)
+    analysis_data['players'] = []
+    for i, box in enumerate(player_boxes):
+        draw_player_bounding_box(frame, box, player_name=f"Player {i+1}")
+        analysis_data['players'].append({'id': i+1, 'bbox': box})
 
-                    if current_racket_speed > self.peak_racket_speed:
-                        self.peak_racket_speed = current_racket_speed
-                
-                self.previous_racket_position = current_racket_position
-                
-                cv2.drawContours(frame, [racket_contour], -1, (0, 255, 0), 2)
-                cv2.circle(frame, current_racket_position, 5, (0, 0, 255), -1)
+    # 2. Detect Shuttlecock
+    shuttlecock_pos = detect_shuttlecock(frame, SHUTTLECOCK_MODEL)
+    SHUTTLECOCK_TRAIL.append(shuttlecock_pos)
+    analysis_data['shuttlecock_position'] = shuttlecock_pos
 
-        return frame, current_racket_speed
+    # 3. Estimate Trajectory (if enough points are available)
+    # This is a simplification; trajectory would be estimated over a shot, not on every frame.
+    if len(SHUTTLECOCK_TRAIL) > 5:
+        # Convert deque to list for the function
+        trajectory_func = estimate_shot_trajectory(list(SHUTTLECOCK_TRAIL), 30) # Assuming 30fps
+        if trajectory_func:
+            draw_trajectory(frame, trajectory_func, frame.shape[1])
+            analysis_data['trajectory_coeffs'] = trajectory_func.coeffs.tolist()
+
+    # 4. Draw shuttlecock and its trail
+    draw_shuttlecock_position(frame, shuttlecock_pos, trail=list(SHUTTLECOCK_TRAIL))
+
+    return frame, analysis_data
