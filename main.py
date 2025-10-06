@@ -1,100 +1,66 @@
 import cv2
-import os
+import numpy as np
+import mediapipe as mp
+from algorithm import find_smash_frame, process_frame_for_pose
+from visualize import draw_pose_landmarks
 
-# Main application imports
-import config
-from utils import ensure_dir_exists, save_results
-from preprocessing import (
-    read_video,
-    get_video_properties,
-    resize_frame,
-    create_background_subtractor,
-    subtract_background
-)
-from detect import process_frame_for_detection
-from visualization import display_stats
+def main(user_video_path, ref_video_path, output_video_path):
+    pose_model = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-def main():
-    """
-    Main function to run the badminton video analysis pipeline.
-    """
-    # --- Setup ---
-    # Ensure the output directory exists
-    output_dir = os.path.dirname(config.VIDEO_OUTPUT_PATH)
-    ensure_dir_exists(output_dir)
+    user_smash_frame = find_smash_frame(user_video_path)
+    ref_smash_frame = find_smash_frame(ref_video_path)
 
-    # --- Video Loading ---
-    try:
-        cap = read_video(config.VIDEO_INPUT_PATH)
-    except IOError as e:
-        print(f"Error: {e}")
-        return
+    cap_user = cv2.VideoCapture(user_video_path)
+    cap_ref = cv2.VideoCapture(ref_video_path)
 
-    width, height, fps = get_video_properties(cap)
-    print(f"Input video properties: {width}x{height} @ {fps:.2f} FPS")
+    frame_offset = ref_smash_frame - user_smash_frame
+    if frame_offset > 0:
+        cap_ref.set(cv2.CAP_PROP_POS_FRAMES, frame_offset)
+    elif frame_offset < 0:
+        cap_user.set(cv2.CAP_PROP_POS_FRAMES, abs(frame_offset))
 
-    # --- Video Writer Setup ---
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Or 'XVID'
-    out = cv2.VideoWriter(
-        config.VIDEO_OUTPUT_PATH,
-        fourcc,
-        fps,
-        (config.RESIZE_WIDTH, config.RESIZE_HEIGHT)
-    )
+    output_height = 720
+    user_w = int(cap_user.get(cv2.CAP_PROP_FRAME_WIDTH))
+    user_h = int(cap_user.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    ref_w = int(cap_ref.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ref_h = int(cap_ref.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # --- Main Processing Loop ---
-    frame_count = 0
-    all_analysis_data = []
+    user_aspect_ratio = user_w / user_h
+    ref_aspect_ratio = ref_w / ref_h
+    output_w_user = int(output_height * user_aspect_ratio)
+    output_w_ref = int(output_height * ref_aspect_ratio)
+    
+    output_width = output_w_user + output_w_ref
+    frame_size = (output_width, output_height)
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    video_writer = cv2.VideoWriter(output_video_path, fourcc, 30, frame_size)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    print("Processing videos...")
+    while True:
+        ret_user, frame_user = cap_user.read()
+        ret_ref, frame_ref = cap_ref.read()
+
+        if not ret_user or not ret_ref:
             break
 
-        # --- Preprocessing ---
-        # Resize frame for consistent processing
-        frame = resize_frame(frame, config.RESIZE_WIDTH, config.RESIZE_HEIGHT)
+        frame_user, results_user = process_frame_for_pose(frame_user, pose_model)
+        frame_ref, results_ref = process_frame_for_pose(frame_ref, pose_model)
 
-        # --- Detection and Analysis ---
-        # The core logic is encapsulated in process_frame_for_detection
-        processed_frame, frame_analysis = process_frame_for_detection(frame.copy())
-        frame_analysis['frame_number'] = frame_count
-        all_analysis_data.append(frame_analysis)
+        draw_pose_landmarks(frame_user, results_user)
+        draw_pose_landmarks(frame_ref, results_ref)
 
-        # --- Visualization ---
-        # Display mock statistics on the frame
-        mock_stats = {
-            "Rally Time": f"{(frame_count / fps):.1f}s",
-            "Last Stroke": "Smash" # This would come from analysis
-        }
-        display_stats(processed_frame, mock_stats)
+        resized_user = cv2.resize(frame_user, (output_w_user, output_height))
+        resized_ref = cv2.resize(frame_ref, (output_w_ref, output_height))
 
-        # --- Output ---
-        # Write the processed frame to the output video file
-        out.write(processed_frame)
+        combined_frame = np.hstack((resized_user, resized_ref))
+        video_writer.write(combined_frame)
 
-        # Display the resulting frame (optional)
-        cv2.imshow('Badminton Analysis', processed_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-        frame_count += 1
-        print(f"Processed frame {frame_count}", end='\r')
-
-    # --- Cleanup ---
-    print("\nFinished processing video.")
-    cap.release()
-    out.release()
+    cap_user.release()
+    cap_ref.release()
+    video_writer.release()
+    pose_model.close()
     cv2.destroyAllWindows()
-
-    # --- Save Results ---
-    results_to_save = {
-        "video_properties": {"width": width, "height": height, "fps": fps},
-        "analysis_summary": {"total_frames": frame_count},
-        "frame_by_frame_data": all_analysis_data
-    }
-    save_results(results_to_save, config.RESULTS_JSON_PATH)
+    print(f"Processing complete. Output saved to {output_video_path}")
 
 if __name__ == '__main__':
-    main()
+    main('input_video.mp4', 'sample.mp4', 'output_video.avi')
