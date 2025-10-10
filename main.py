@@ -1,40 +1,61 @@
 import cv2
 import numpy as np
-from pose_helper import track_pose
+import mediapipe as mp
+import os
 from audio_analyzer import loudest_sound_time
+from pose_helper import track_pose
 
-def get_reference_distance(landmarks):
-    distances = []
-    for frame in landmarks:
-        if 11 in frame and 12 in frame:
-            x1, y1 = frame[11]['x'], frame[11]['y']
-            x2, y2 = frame[12]['x'], frame[12]['y']
-            dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            distances.append(dist)
-    return np.median(distances) if distances else 1.0
+def get_pose_center_and_scale(frame_landmarks):
+    if not frame_landmarks:
+        return None, None
 
-def normalize_landmarks(landmarks, target_distance):
-    current_distance = get_reference_distance(landmarks)
-    scale = target_distance / current_distance if current_distance > 0 else 1.0
+    # Use hips and shoulders for a stable center and scale
+    left_hip = frame_landmarks.get(23)
+    right_hip = frame_landmarks.get(24)
+    left_shoulder = frame_landmarks.get(11)
+    right_shoulder = frame_landmarks.get(12)
+
+    if not all([left_hip, right_hip, left_shoulder, right_shoulder]):
+        return None, None
+
+    if any(lm['visibility'] < 0.5 for lm in [left_hip, right_hip, left_shoulder, right_shoulder]):
+        return None, None
+
+    hip_x = (left_hip['x'] + right_hip['x']) / 2
+    hip_y = (left_hip['y'] + right_hip['y']) / 2
+    shoulder_x = (left_shoulder['x'] + right_shoulder['x']) / 2
+    shoulder_y = (left_shoulder['y'] + right_shoulder['y']) / 2
     
-    normalized = []
-    for frame in landmarks:
+    center = np.array([hip_x, hip_y])
+    
+    # Scale based on torso height
+    scale = np.sqrt((shoulder_x - hip_x)**2 + (shoulder_y - hip_y)**2)
+    
+    return center, scale
+
+def normalize_and_center_landmarks(landmarks_data):
+    normalized_landmarks = []
+    for frame_landmarks in landmarks_data:
+        center, scale = get_pose_center_and_scale(frame_landmarks)
         norm_frame = {}
-        for idx, lm in frame.items():
-            norm_frame[idx] = {
-                'x': lm['x'] * scale,
-                'y': lm['y'] * scale,
-                'z': lm['z'] * scale,
-                'visibility': lm['visibility']
-            }
-        normalized.append(norm_frame)
-    return normalized
+        if center is not None and scale > 1e-6:
+            for idx, lm in frame_landmarks.items():
+                norm_x = (lm['x'] - center[0]) / scale
+                norm_y = (lm['y'] - center[1]) / scale
+                # Z is not used for 2D comparison but kept for data integrity
+                norm_z = (lm['z']) / scale 
+                norm_frame[idx] = {
+                    'x': norm_x, 'y': norm_y, 'z': norm_z, 
+                    'visibility': lm['visibility']
+                }
+        normalized_landmarks.append(norm_frame)
+    return normalized_landmarks
 
 def compute_deviation(coords1, coords2):
     total_deviation = 0
     count = 0
-    
     min_len = min(len(coords1), len(coords2))
+
     for i in range(min_len):
         frame1, frame2 = coords1[i], coords2[i]
         for idx in frame1:
@@ -49,8 +70,8 @@ def compute_deviation(coords1, coords2):
 
 def compute_per_joint_deviation(coords1, coords2):
     joint_deviations = {}
-    
     min_len = min(len(coords1), len(coords2))
+
     for i in range(min_len):
         frame1, frame2 = coords1[i], coords2[i]
         for idx in frame1:
@@ -66,92 +87,72 @@ def compute_per_joint_deviation(coords1, coords2):
     avg_deviations = {idx: np.mean(devs) for idx, devs in joint_deviations.items()}
     return avg_deviations
 
-def deviation_to_color(deviation, max_dev=0.3):
+def deviation_to_color(deviation, max_dev=0.5):
     normalized = min(deviation / max_dev, 1.0)
     green = int(255 * (1 - normalized))
     red = int(255 * normalized)
     return (0, green, red)
 
-def draw_colored_pose(frame, landmarks, frame_idx, joint_deviations, original_width, original_height):
-    if not landmarks or frame_idx >= len(landmarks):
+def draw_skeleton(frame, frame_landmarks, joint_deviations, is_overlay=False, ref_center=None, ref_scale=None):
+    if not frame_landmarks:
         return frame
-    
-    frame_lm = landmarks[frame_idx]
+        
+    h, w, _ = frame.shape
     
     connections = [
-        (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-        (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
-        (24, 26), (26, 28), (15, 17), (15, 19), (15, 21),
-        (16, 18), (16, 20), (16, 22)
+        (11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24),
+        (23, 24), (23, 25), (25, 27), (24, 26), (26, 28)
     ]
-    
-    for idx, lm in frame_lm.items():
-        if lm['visibility'] > 0.5:
-            x = int(lm['x'] * original_width)
-            y = int(lm['y'] * original_height)
-            color = deviation_to_color(joint_deviations.get(idx, 0))
-            cv2.circle(frame, (x, y), 5, color, -1)
-    
-    for conn in connections:
-        if conn[0] in frame_lm and conn[1] in frame_lm:
-            if frame_lm[conn[0]]['visibility'] > 0.5 and frame_lm[conn[1]]['visibility'] > 0.5:
-                x1 = int(frame_lm[conn[0]]['x'] * original_width)
-                y1 = int(frame_lm[conn[0]]['y'] * original_height)
-                x2 = int(frame_lm[conn[1]]['x'] * original_width)
-                y2 = int(frame_lm[conn[1]]['y'] * original_height)
-                avg_dev = (joint_deviations.get(conn[0], 0) + joint_deviations.get(conn[1], 0)) / 2
-                color = deviation_to_color(avg_dev)
-                cv2.line(frame, (x1, y1), (x2, y2), color, 2)
-    
+
+    points_to_draw = {}
+    for idx, lm in frame_landmarks.items():
+        if lm['visibility'] < 0.5:
+            continue
+
+        if is_overlay:
+            # Transform normalized coordinates to reference frame's space
+            x = int((lm['x'] * ref_scale + ref_center[0]) * w)
+            y = int((lm['y'] * ref_scale + ref_center[1]) * h)
+        else:
+            # Use raw coordinates
+            x = int(lm['x'] * w)
+            y = int(lm['y'] * h)
+            
+        color = deviation_to_color(joint_deviations.get(idx, 0))
+        points_to_draw[idx] = ((x, y), color)
+
+    for p1_idx, p2_idx in connections:
+        if p1_idx in points_to_draw and p2_idx in points_to_draw:
+            pt1, color1 = points_to_draw[p1_idx]
+            pt2, color2 = points_to_draw[p2_idx]
+            avg_dev = (joint_deviations.get(p1_idx, 0) + joint_deviations.get(p2_idx, 0)) / 2
+            line_color = deviation_to_color(avg_dev)
+            cv2.line(frame, pt1, pt2, line_color, 2)
+
+    for idx, (pt, color) in points_to_draw.items():
+        cv2.circle(frame, pt, 5, color, -1)
+        
     return frame
 
-def side_by_side_tracked(video1_path, video2_path, output_path="aligned_output.mp4", target_height=480):
-    cap1_orig = cv2.VideoCapture(video1_path)
-    cap2_orig = cv2.VideoCapture(video2_path)
-    
-    w1_orig = int(cap1_orig.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h1_orig = int(cap1_orig.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    w2_orig = int(cap2_orig.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h2_orig = int(cap2_orig.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    cap1_orig.release()
-    cap2_orig.release()
-    
+
+def side_by_side_tracked(video1_path, video2_path, output_path="aligned_output.mp4", target_height=720):
     coords_input = track_pose(video1_path)
     coords_reference = track_pose(video2_path)
     
-    ref_distance = get_reference_distance(coords_reference)
-    coords_input_normalized = normalize_landmarks(coords_input, ref_distance)
-    coords_reference_normalized = normalize_landmarks(coords_reference, ref_distance)
-    
+    coords_input_normalized = normalize_and_center_landmarks(coords_input)
+    coords_reference_normalized = normalize_and_center_landmarks(coords_reference)
+
     joint_deviations = compute_per_joint_deviation(coords_input_normalized, coords_reference_normalized)
-    
-    tracked1 = f"tracked_{video1_path}"
-    tracked2 = f"tracked_{video2_path}"
     
     t1 = loudest_sound_time(video1_path)
     t2 = loudest_sound_time(video2_path)
     
-    cap1 = cv2.VideoCapture(tracked1)
-    cap2 = cv2.VideoCapture(tracked2)
+    cap1 = cv2.VideoCapture(video1_path)
+    cap2 = cv2.VideoCapture(video2_path)
     
     fps1 = cap1.get(cv2.CAP_PROP_FPS)
     fps2 = cap2.get(cv2.CAP_PROP_FPS)
     fps = max(fps1, fps2)
-    
-    frames1, frames2 = [], []
-    
-    while True:
-        ret, frame = cap1.read()
-        if not ret: break
-        frames1.append(frame)
-    cap1.release()
-    
-    while True:
-        ret, frame = cap2.read()
-        if not ret: break
-        frames2.append(frame)
-    cap2.release()
     
     f1_offset = int(t1 * fps1)
     f2_offset = int(t2 * fps2)
@@ -159,52 +160,88 @@ def side_by_side_tracked(video1_path, video2_path, output_path="aligned_output.m
     pre_pad1 = max(0, f2_offset - f1_offset)
     pre_pad2 = max(0, f1_offset - f2_offset)
     
-    coords_input = [{}] * pre_pad1 + coords_input
+    coords_input_padded = ([{}] * pre_pad1) + coords_input
+    coords_reference_padded = ([{}] * pre_pad2) + coords_reference
+    coords_input_norm_padded = ([{}] * pre_pad1) + coords_input_normalized
+
+    cap1.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    frames1, frames2 = [], []
+    while True:
+        ret, frame = cap1.read(); 
+        if not ret: break
+        frames1.append(frame)
+    while True:
+        ret, frame = cap2.read(); 
+        if not ret: break
+        frames2.append(frame)
+
+    cap1.release()
+    cap2.release()
     
-    black1 = np.zeros_like(frames1[0])
-    black2 = np.zeros_like(frames2[0])
+    h1, w1, _ = frames1[0].shape
+    h2, w2, _ = frames2[0].shape
     
-    frames1 = [black1] * pre_pad1 + frames1
-    frames2 = [black2] * pre_pad2 + frames2
+    aspect1 = w1 / h1
+    aspect2 = w2 / h2
     
-    max_len = max(len(frames1), len(frames2))
-    while len(frames1) < max_len: 
-        frames1.append(black1)
-        coords_input.append({})
-    while len(frames2) < max_len: 
-        frames2.append(black2)
+    new_w1 = int(target_height * aspect1)
+    new_w2 = int(target_height * aspect2)
     
-    h1 = frames1[0].shape[0]
-    h2 = frames2[0].shape[0]
-    scale_factor2 = h1 / h2
-    frames2 = [cv2.resize(f, (int(f.shape[1] * scale_factor2), h1)) for f in frames2]
+    frames1 = [cv2.resize(f, (new_w1, target_height)) for f in frames1]
+    frames2 = [cv2.resize(f, (new_w2, target_height)) for f in frames2]
     
-    w1 = frames1[0].shape[1]
-    w2 = frames2[0].shape[1]
-    h = h1
-    
-    for i in range(len(frames1)):
-        frames1[i] = draw_colored_pose(frames1[i], coords_input, i, joint_deviations, w1_orig, h1_orig)
-    
-    for i in range(len(frames2)):
-        frames2[i] = draw_colored_pose(frames2[i], coords_reference, i, joint_deviations, w2_orig, h2_orig)
-    
-    out_w = w1 + w2
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_w, h))
-    
-    for f1, f2 in zip(frames1, frames2):
-        combined = np.hstack([f1, f2])
-        out.write(combined)
-    
+    black1 = np.zeros((target_height, new_w1, 3), dtype=np.uint8)
+    black2 = np.zeros((target_height, new_w2, 3), dtype=np.uint8)
+
+    frames1_padded = ([black1] * pre_pad1) + frames1
+    frames2_padded = ([black2] * pre_pad2) + frames2
+
+    max_len = max(len(frames1_padded), len(frames2_padded))
+    while len(frames1_padded) < max_len: frames1_padded.append(black1)
+    while len(frames2_padded) < max_len: frames2_padded.append(black2)
+    while len(coords_input_padded) < max_len: coords_input_padded.append({})
+    while len(coords_reference_padded) < max_len: coords_reference_padded.append({})
+    while len(coords_input_norm_padded) < max_len: coords_input_norm_padded.append({})
+
+    output_frames = []
+    for i in range(max_len):
+        f1 = frames1_padded[i]
+        f2 = frames2_padded[i]
+
+        lm1_raw = coords_input_padded[i]
+        lm2_raw = coords_reference_padded[i]
+        lm1_norm = coords_input_norm_padded[i]
+
+        f1_out = draw_skeleton(f1.copy(), lm1_raw, joint_deviations)
+
+        f2_overlay = f2.copy()
+        ref_center, ref_scale = get_pose_center_and_scale(lm2_raw)
+
+        if ref_center is not None and ref_scale is not None:
+            # Draw reference skeleton in white
+            f2_overlay = draw_skeleton(f2_overlay, lm2_raw, {}) 
+            # Draw input skeleton overlayed and colored by deviation
+            f2_overlay = draw_skeleton(f2_overlay, lm1_norm, joint_deviations, is_overlay=True, ref_center=ref_center, ref_scale=ref_scale)
+
+        combined = np.hstack([f1_out, f2_overlay])
+        output_frames.append(combined)
+
+    out_h, out_w, _ = output_frames[0].shape
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_w, out_h))
+    for frame in output_frames:
+        out.write(frame)
     out.release()
     
     avg_deviation = compute_deviation(coords_input_normalized, coords_reference_normalized)
     
     print(f"Side-by-side video saved to {output_path}")
-    print(f"Average deviation: {avg_deviation:.4f}")
+    print(f"Average deviation score: {avg_deviation:.4f}")
     print("Per-joint deviations:")
     for idx, dev in sorted(joint_deviations.items()):
         print(f"  Joint {idx}: {dev:.4f}")
 
 if __name__ == "__main__":
     side_by_side_tracked("input_video.mp4", "reference_video.mp4")
+    
